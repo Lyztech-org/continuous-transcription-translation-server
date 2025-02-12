@@ -88,7 +88,7 @@ app.post('/google-speech-to-text', upload.single('audio'), async (req, res) => {
         es: 'es-ES',
         ar: 'ar-SA',
         hi: 'hi-IN',
-        bn: 'bn-IN',
+        bn: 'bn-BD',
         id: 'id-ID',
         fil: 'fil-PH',
         ja: 'ja-JP'
