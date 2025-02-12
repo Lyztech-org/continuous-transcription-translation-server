@@ -52,6 +52,7 @@ const upload = multer({
 const detectLanguage = async text => {
   try {
     const [detection] = await translateClient.detect(text)
+    console.log('Language detection:', detection)
     return detection.language
   } catch (error) {
     console.error('Language detection error:', error)
@@ -79,6 +80,24 @@ app.post('/google-speech-to-text', upload.single('audio'), async (req, res) => {
     }
 
     const targetLanguage = req.body.targetLanguage || 'en'
+
+    // Convert ISO language code to BCP-47 language code
+    const getBCP47LanguageCode = languageCode => {
+      const languageMap = {
+        en: 'en-US',
+        es: 'es-ES',
+        ar: 'ar-SA',
+        hi: 'hi-IN',
+        bn: 'bn-IN',
+        id: 'id-ID',
+        fil: 'fil-PH',
+        ja: 'ja-JP'
+      }
+      return languageMap[languageCode] || languageCode
+    }
+
+    const bcp47LanguageCode = getBCP47LanguageCode(targetLanguage)
+
     if (!config.supportedLanguages.includes(targetLanguage)) {
       return res.status(400).json({ error: 'Unsupported target language' })
     }
@@ -87,11 +106,19 @@ app.post('/google-speech-to-text', upload.single('audio'), async (req, res) => {
     const audioBytes = await fs.readFile(req.file.path)
     const audio = { content: audioBytes.toString('base64') }
 
-    // Configure speech recognition with language detection
+    // Simplified and corrected speech recognition config
     const speechConfig = {
-      languageCode: 'en-US',
-      alternativeLanguageCodes: config.supportedLanguages,
-      enableAutomaticPunctuation: true
+      languageCode: bcp47LanguageCode,
+      alternativeLanguageCodes: config.supportedLanguages.filter(
+        lang => lang !== targetLanguage
+      ),
+      enableAutomaticPunctuation: true,
+      model: 'latest_long',
+      metadata: {
+        interactionType: 'DICTATION',
+        microphoneDistance: 'NEARFIELD',
+        recordingDeviceType: 'SMARTPHONE'
+      }
     }
 
     // Perform speech recognition
@@ -99,6 +126,13 @@ app.post('/google-speech-to-text', upload.single('audio'), async (req, res) => {
       audio,
       config: speechConfig
     })
+
+    // Handle no results
+    if (!response.results || response.results.length === 0) {
+      throw new Error('No speech could be recognized')
+    }
+
+    // Get transcription
     const transcription = response.results
       .map(result => result.alternatives[0].transcript)
       .join(' ')
@@ -115,13 +149,20 @@ app.post('/google-speech-to-text', upload.single('audio'), async (req, res) => {
       sourceLanguage: detectedLanguage,
       targetLanguage,
       transcription,
-      translation
+      translation,
+      details: {
+        usedConfig: {
+          primaryLanguage: targetLanguage,
+          alternativeLanguages: speechConfig.alternativeLanguageCodes
+        }
+      }
     })
   } catch (error) {
     console.error('Google Speech API error:', error)
     res.status(500).json({
       success: false,
-      error: error.message || 'Internal server error'
+      error: error.message || 'Internal server error',
+      details: error.details || undefined
     })
   }
 })

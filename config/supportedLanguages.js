@@ -12,8 +12,6 @@ const supportedLanguages = [
   'ar-XA',
   'ar-EG',
   'ar-SA',
-  'hi',
-  'hi-IN',
   'bn',
   'bn-IN',
   'bn-BD',
