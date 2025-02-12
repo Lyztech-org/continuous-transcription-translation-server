@@ -1,114 +1,150 @@
 require('dotenv').config()
-
 const express = require('express')
 const cors = require('cors')
 const multer = require('multer')
-const fs = require('fs')
-const { join } = require('path')
+const fs = require('fs').promises
+const path = require('path')
 const OpenAI = require('openai')
-const mime = require('mime-types')
 const { SpeechClient } = require('@google-cloud/speech')
 const { Translate } = require('@google-cloud/translate').v2
 
+// Configuration
+const config = require('./config')
+// Initialize clients
 const app = express()
-const port = process.env.PORT || 5000
 
-app.use(cors())
-app.use(express.json())
-
-// Set up multer for file uploads
-const upload = multer({ dest: 'uploads/' })
-
-const openai = new OpenAI({
-  apiKey: process.env.OPEN_AI_API_KEY
-})
-
-// Initialize Google Cloud clients
 const speechClient = new SpeechClient()
 const translateClient = new Translate()
 
-app.post('/speech-to-text', upload.single('file'), async (req, res) => {
-  try {
-    const file = req.file
+// Middleware
+app.use(cors())
+app.use(express.json())
 
-    if (!file) {
-      return res.status(400).json({ message: 'No file uploaded' })
+// Configure multer
+const storage = multer.diskStorage({
+  destination: async (req, file, cb) => {
+    try {
+      await fs.mkdir(config.uploadDir, { recursive: true })
+      cb(null, config.uploadDir)
+    } catch (error) {
+      cb(error)
     }
-
-    // Construct the full path to the uploaded file with the correct extension
-    const originalPath = join(process.cwd(), 'uploads', file.filename)
-    const newPath = `${originalPath}.webm`
-
-    // Rename the file to include the extension
-    fs.renameSync(originalPath, newPath)
-
-    // Process the file with OpenAI API
-    const [transcription, translation] = await Promise.all([
-      openai.audio.transcriptions.create({
-        file: fs.createReadStream(newPath),
-        model: 'whisper-1',
-        response_format: 'text'
-      }),
-      openai.audio.translations.create({
-        file: fs.createReadStream(newPath),
-        model: 'whisper-1',
-        response_format: 'text'
-      })
-    ])
-
-    // Clean up the uploaded file
-    fs.unlinkSync(newPath)
-
-    return res.status(200).json({ transcription, translation })
-  } catch (error) {
-    console.error(error)
-    return res.status(500).json({ message: 'Error processing audio' })
+  },
+  filename: (req, file, cb) => {
+    const extension = path.extname(file.originalname)
+    cb(null, `${Date.now()}${extension}`)
   }
 })
 
-app.post('/google-speech-to-text', upload.single('file'), async (req, res) => {
-  try {
-    const file = req.file
+const upload = multer({
+  storage,
+  limits: { fileSize: config.maxFileSize },
+  fileFilter: (req, file, cb) => {
+    if (config.supportedMimeTypes.includes(file.mimetype)) {
+      cb(null, true)
+    } else {
+      cb(new Error('Unsupported file type'))
+    }
+  }
+})
 
-    if (!file) {
-      return res.status(400).json({ message: 'No file uploaded' })
+// Helper functions
+const detectLanguage = async text => {
+  try {
+    const [detection] = await translateClient.detect(text)
+    return detection.language
+  } catch (error) {
+    console.error('Language detection error:', error)
+    return 'en' // Default to English
+  }
+}
+
+const translateText = async (text, targetLanguage) => {
+  try {
+    const sourceLanguage = await detectLanguage(text)
+    if (sourceLanguage === targetLanguage) {
+      return text
+    }
+    const [translation] = await translateClient.translate(text, targetLanguage)
+    return translation
+  } catch (error) {
+    throw new Error(`Translation error: ${error.message}`)
+  }
+}
+
+app.post('/google-speech-to-text', upload.single('audio'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No audio file provided' })
     }
 
-    // Construct the full path to the uploaded file
-    const filePath = join(process.cwd(), 'uploads', file.filename)
+    const targetLanguage = req.body.targetLanguage || 'en'
+    if (!config.supportedLanguages.includes(targetLanguage)) {
+      return res.status(400).json({ error: 'Unsupported target language' })
+    }
 
-    // Read the file into a buffer
-    const audioBytes = fs.readFileSync(filePath).toString('base64')
+    // Read audio file
+    const audioBytes = await fs.readFile(req.file.path)
+    const audio = { content: audioBytes.toString('base64') }
 
-    // Configure request for Google Speech-to-Text
-    const audio = { content: audioBytes }
-    const config = { languageCode: 'en-US' }
-    const request = { audio, config }
+    // Configure speech recognition with language detection
+    const speechConfig = {
+      languageCode: 'en-US',
+      alternativeLanguageCodes: config.supportedLanguages,
+      enableAutomaticPunctuation: true
+    }
 
-    // Detect speech in the audio file
-    const [response] = await speechClient.recognize(request)
-    console.log(response)
+    // Perform speech recognition
+    const [response] = await speechClient.recognize({
+      audio,
+      config: speechConfig
+    })
     const transcription = response.results
       .map(result => result.alternatives[0].transcript)
-      .join('\n')
+      .join(' ')
 
-    // Translate the transcription
-    const [translation] = await translateClient.translate(transcription, 'es') // Translate to Spanish
+    // Detect language and translate
+    const detectedLanguage = await detectLanguage(transcription)
+    const translation = await translateText(transcription, targetLanguage)
 
-    // Clean up the uploaded file
-    fs.unlinkSync(filePath)
+    // Clean up
+    await fs.unlink(req.file.path)
 
-    return res.status(200).json({ transcription, translation })
+    res.json({
+      success: true,
+      sourceLanguage: detectedLanguage,
+      targetLanguage,
+      transcription,
+      translation
+    })
   } catch (error) {
-    console.error(error)
-    return res.status(500).json({ message: 'Error processing audio' })
+    console.error('Google Speech API error:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error'
+    })
   }
 })
 
-app.get('/', (req, res) => {
-  res.send('Hello World!')
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    supportedLanguages: config.supportedLanguages,
+    supportedMimeTypes: config.supportedMimeTypes
+  })
 })
 
-app.listen(port, () => {
-  console.log(`Server is running at http://localhost:${port}`)
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Global error handler:', error)
+  res.status(500).json({
+    success: false,
+    error: error.message || 'Internal server error'
+  })
+})
+
+// Start server
+app.listen(config.port, () => {
+  console.log(`Server running on port ${config.port}`)
 })
